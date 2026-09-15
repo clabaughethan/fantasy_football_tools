@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 import json
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import date
 
@@ -73,6 +74,15 @@ class RankedPlayer:
     def match_key(self) -> str:
         """Cross-source identity key. See `ff_tools.utils.names.match_key`."""
         return self.player.match_key
+
+    @property
+    def injury_status(self) -> str:
+        """Game-day injury designation, empty when nothing is published."""
+        return self.player.injury_status
+
+    @property
+    def injury_body_part(self) -> str:
+        return self.player.injury_body_part
 
 
 class RankingsSource:
@@ -203,9 +213,19 @@ class RankingsSource:
         Attribution required: https://fantasyfootballcalculator.com
 
         FantasyFootballCalculator only serves 8/10/12/14-team ADP. For deeper
-        leagues the request falls back to the largest available size (14) with
-        a note in each player's `source` field. 32-team ADP does not exist on
-        any free public API because the format is too rare.
+        leagues the request falls back to the largest available size (14) and
+        records which one answered in each player's `source` field, readable
+        back with `adp_reference_teams`. 32-team ADP does not exist on any free
+        public API because the format is too rare.
+
+        A fallback ADP is still directly comparable to a pick number, because
+        ADP counts players off the board rather than rounds: "ADP 45" means the
+        45th player taken in either format. What it is not is unbiased - a
+        14-team league needs 14 starting quarterbacks and a 32-team league needs
+        32, so positional demand differs and some positions genuinely go earlier
+        in a deep league than the reference board says. Treat a fallback ADP as
+        a directional read, which is why the reference size is preserved rather
+        than quietly folded into a bare number.
         """
         url = f"https://fantasyfootballcalculator.com/api/v1/adp/{scoring}"
         # Try the requested size first; fall back through the available sizes.
@@ -229,7 +249,11 @@ class RankingsSource:
                 team=normalize_team(pdata.get("team")),
             )
             adp = _as_float(pdata.get("adp"), 0.0)
-            adp_round = ((adp - 1) // adp_teams + 1) if adp > 0 else 0
+            # Rounds are relative to the league being drafted, not to whichever
+            # board supplied the ADP. The ordinal transfers between formats; the
+            # round it lands in does not, so dividing by the fallback size would
+            # report round 4 of 14 for a pick that is round 2 of the user's 32.
+            adp_round = ((adp - 1) // teams + 1) if adp > 0 and teams > 0 else 0
 
             ranked.append(
                 RankedPlayer(
@@ -243,6 +267,22 @@ class RankingsSource:
                 )
             )
         return ranked
+
+    @staticmethod
+    def adp_reference_teams(source: str) -> int | None:
+        """Read the league size an ADP figure came from out of its source label.
+
+        `fetch_fantasycalculator_adp` tags results `fantasyfootballcalculator-14t`
+        when it falls back, so consumers can say which board a number describes.
+        Returns None for a label that carries no size, including ADP loaded from
+        a user CSV, where the provenance is the user's own business.
+        """
+        if not source:
+            return None
+        tail = source.rsplit("-", 1)[-1]
+        if tail.endswith("t") and tail[:-1].isdigit():
+            return int(tail[:-1])
+        return None
 
     def merge_rankings_with_adp(
         self,
@@ -275,6 +315,70 @@ class RankingsSource:
                 rp.player.team = source.player.team
 
         return rankings
+
+    def merge_injury_status(
+        self,
+        rankings: list[RankedPlayer],
+        players: Iterable[Player],
+    ) -> int:
+        """Copy injury designations from a player pool onto a rankings list.
+
+        Consensus rankings carry no injury data - the FantasyPros ECR payload has
+        no such field - so availability has to come from a roster source. Sleeper
+        publishes `injury_status` and `injury_body_part` for the whole league,
+        which is what `SleeperClient.get_players()` returns.
+
+        `players` is taken as an iterable of `Player` rather than fetched here so
+        the caller's already-cached pool is reused; the full Sleeper player list
+        is ~14MB and no draft needs to download it twice.
+
+        Returns the number of players that were flagged, so a caller can tell a
+        clean league from a merge that silently matched nothing.
+        """
+        pool = self._index_pool_for_injuries(players)
+
+        flagged = 0
+        for rp in rankings:
+            key = rp.match_key
+            if not key:
+                continue
+            # Position-qualified first: name-only keys collide across positions,
+            # and a namesake's injury is worse than no injury data at all.
+            source = pool.get((key, rp.position)) or pool.get((key, ""))
+            if source is None:
+                continue
+            rp.player.injury_status = source.injury_status
+            rp.player.injury_body_part = source.injury_body_part
+            # Roster standing is a second availability signal (IR, PUP) that
+            # moves independently of the game-day designation.
+            if source.status:
+                rp.player.status = source.status
+            if source.injury_status:
+                flagged += 1
+
+        return flagged
+
+    @staticmethod
+    def _index_pool_for_injuries(
+        players: Iterable[Player],
+    ) -> dict[tuple[str, str], Player]:
+        """Index a player pool by match key, both with and without position.
+
+        Sleeper's pool holds roughly 4,000 players at fantasy positions, many of
+        them practice-squad namesakes of real starters. Where two share a name,
+        an active player on a real team wins, because attaching a fringe player's
+        injury to a first-round pick is the failure mode that matters here.
+        """
+        index: dict[tuple[str, str], Player] = {}
+        for p in players:
+            key = p.match_key
+            if not key:
+                continue
+            for variant in ((key, p.position), (key, "")):
+                held = index.get(variant)
+                if held is None or _pool_priority(p) > _pool_priority(held):
+                    index[variant] = p
+        return index
 
     def fetch_espn_rankings(
         self, season: str | int | None = None, limit: int = 300
@@ -417,6 +521,15 @@ class RankingsSource:
 
         _warn_if_positions_missing(ranked, filepath)
         return ranked
+
+
+def _pool_priority(player: Player) -> tuple[int, int]:
+    """Rank a pool entry's claim to a name, best last.
+
+    Active beats inactive and a rostered team beats a free agent, so a fringe
+    namesake cannot outrank the starter whose name the rankings list means.
+    """
+    return (1 if player.active else 0, 1 if player.team else 0)
 
 
 def _fp_position(pdata: dict) -> str:

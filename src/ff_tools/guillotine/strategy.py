@@ -4,7 +4,7 @@ Computes guillotine-specific player valuations that prioritize survival
 (avoiding the lowest weekly score) over ceiling (chasing the highest score).
 
 Scoring is rank-based, not projection-based. The survival score is:
-    score = rank_score * floor * position_value * scarcity * need
+    score = rank_score * floor * position_value * scarcity * need * availability
 
 Where rank_score = 1000 / rank (so rank 1 = 1000, rank 10 = 100, etc.)
 """
@@ -14,6 +14,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from ff_tools.draft.rankings import RankedPlayer
+from ff_tools.guillotine.injury import InjuryAssessment
 from ff_tools.models.player import Player
 
 # Positional value multipliers for deep guillotine leagues.
@@ -87,6 +88,79 @@ DEFAULT_POOL_SIZES: dict[str, int] = {
     "DEF": 25,
 }
 
+# Probability a player with each designation is on the field, keyed on the
+# uppercased value Sleeper publishes in `injury_status`.
+#
+# These are probabilities with a real referent, not value multipliers - which is
+# what the previous version of this table conflated. Questionable players
+# historically suit up around three times in four; Doubtful is roughly the
+# inverse. Keeping this a probability is what lets the value question (how much
+# does missing him actually cost?) be answered separately, from the league's own
+# replacement depth, instead of being folded into the same hand-tuned number.
+INJURY_PLAY_PROBABILITY: dict[str, float] = {
+    "QUESTIONABLE": 0.75,
+    "COV": 0.60,
+    "DOUBTFUL": 0.28,
+    "OUT": 0.02,
+    "NA": 0.05,  # not active / non-football injury
+    "PUP": 0.05,
+    "SUS": 0.02,  # suspended
+    "SUSPENDED": 0.02,
+    "IR": 0.02,
+    "DNR": 0.02,  # did not report
+}
+
+# Designations that mean "healthy" rather than "no data". ESPN publishes
+# "ACTIVE" where Sleeper publishes null.
+_HEALTHY_DESIGNATIONS = frozenset({"", "ACTIVE", "PROBABLE", "HEALTHY"})
+
+# Designations describing a player expected back shortly, for whom a waiver
+# pickup is a genuine one-week patch. "Out" belongs here: on Sleeper it means out
+# for this game, not gone for the season. The rest describe a stretch absence,
+# which is a different proposition - it ties up a roster spot rather than costing
+# a week - and that is what separates an Out player from one on IR.
+_NEAR_TERM_DESIGNATIONS = frozenset({"QUESTIONABLE", "DOUBTFUL", "COV", "OUT"})
+
+# Roster standings that override the game-day designation. A player on IR is
+# unavailable whether or not this week's injury report mentions him.
+_UNAVAILABLE_ROSTER_STATUS: dict[str, str] = {
+    "INJURED RESERVE": "IR",
+    "PHYSICALLY UNABLE TO PERFORM": "PUP",
+    "NON FOOTBALL INJURY": "NA",
+    "SUSPENDED": "SUS",
+}
+
+# How close to full a player is expected to be *if* he takes the field, by body
+# part. This is the question the designation cannot answer and the one that
+# matters for a player who is active but limited.
+#
+# Matched as substrings against the uppercased body part, because Sleeper
+# qualifies the joint: "Knee - ACL", "Knee - ACL + MCL", "Knee - PCL".
+# Structural is checked first so "Knee - ACL" reads as a repaired ligament rather
+# than as generic knee soreness.
+SEVERE_INJURY_PARTS = ("ACL", "PCL", "ACHILLES", "LISFRANC", "SPINE")
+LINGERING_INJURY_PARTS = (
+    "MCL", "KNEE", "HAMSTRING", "GROIN", "CALF", "QUADRICEPS", "THIGH", "FOOT",
+    "ANKLE", "HEEL", "OBLIQUE", "ABDOMEN", "BACK", "NECK", "HIP",
+    "PECTORAL", "BICEPS", "LEG", "LOWER BODY",
+)
+# Things that resolve in days and leave no limitation behind. A concussion
+# belongs here rather than with the soft-tissue injuries: protocol makes it a
+# binary on whether he plays, but a cleared player is not a limited one.
+MINOR_INJURY_PARTS = (
+    "ILLNESS", "REST", "PERSONAL", "THUMB", "HAND", "FINGER", "CONCUSSION",
+    "HEAD",
+)
+
+_SEVERE_EFFECTIVENESS = 0.80
+_LINGERING_EFFECTIVENESS = 0.90
+_UNKNOWN_EFFECTIVENESS = 0.95
+_MINOR_EFFECTIVENESS = 0.98
+
+# Replacement quality assumed when there is no board to measure it from. Halfway
+# is a deliberate non-answer: without the board, positional depth is unknown.
+DEFAULT_REPLACEMENT_RATIO = 0.5
+
 
 @dataclass
 class PlayerScore:
@@ -99,6 +173,16 @@ class PlayerScore:
     need_bonus: float
     scarcity_bonus: float
     survival_score: float
+    # 1.0 for a player with no injury designation; below 1.0 when one is
+    # published. Defaulted so callers constructing a score by hand keep working.
+    availability: float = 1.0
+    # What a replacement would be worth if this player missed a game, in [0, 1].
+    # Reported alongside availability because it is what makes the penalty large
+    # or small, and a bare multiplier hides that reasoning.
+    replacement_ratio: float = DEFAULT_REPLACEMENT_RATIO
+    # Set when a supplied judgement drove the availability rather than the
+    # designation heuristic.
+    assessment: InjuryAssessment | None = None
 
     @property
     def player(self) -> Player:
@@ -111,6 +195,19 @@ class PlayerScore:
     @property
     def display_name(self) -> str:
         return self.ranked_player.display_name
+
+    @property
+    def injury_label(self) -> str:
+        """Short human-readable injury note, empty when the player is clean."""
+        status = self.player.injury_status
+        if not status or status.strip().upper() in _HEALTHY_DESIGNATIONS:
+            # An assessment can flag a player Sleeper has not, which is half the
+            # reason for having one.
+            return "assessed" if self.assessment is not None else ""
+        part = self.player.injury_body_part
+        if part and part.strip().upper() not in {"UNDISCLOSED", "NONE"}:
+            return f"{status} ({part})"
+        return status
 
 
 def rank_to_score(rank: int) -> float:
@@ -307,6 +404,134 @@ def streaming_discount(
     return base_multiplier + (1.0 - base_multiplier) * (1.0 - reach)
 
 
+def body_part_effectiveness(body_part: str) -> float:
+    """How close to full a player is expected to be if he plays, by body part."""
+    part = (body_part or "").strip().upper()
+    if not part:
+        return 1.0
+    # Structural first: "Knee - ACL" is a repaired ligament, not knee soreness.
+    if any(token in part for token in SEVERE_INJURY_PARTS):
+        return _SEVERE_EFFECTIVENESS
+    if any(token in part for token in MINOR_INJURY_PARTS):
+        return _MINOR_EFFECTIVENESS
+    if any(token in part for token in LINGERING_INJURY_PARTS):
+        return _LINGERING_EFFECTIVENESS
+    # "Undisclosed" lands here, and it is the single most common value Sleeper
+    # publishes. A small haircut acknowledges that something is wrong without
+    # inventing a diagnosis; this is exactly the case an assessment improves on.
+    return _UNKNOWN_EFFECTIVENESS
+
+
+def resolve_designation(injury_status: str, roster_status: str = "") -> str:
+    """The operative injury designation, or "" for a player with nothing against him.
+
+    Sleeper's two availability fields move independently - a Questionable player
+    is still status "Active", and a player parked on IR may carry no game-day
+    designation at all - so the worse of the two reads wins.
+    """
+    designation = (injury_status or "").strip().upper()
+    if designation in _HEALTHY_DESIGNATIONS:
+        designation = ""
+    standing = _UNAVAILABLE_ROSTER_STATUS.get((roster_status or "").strip().upper())
+    candidates = [d for d in (designation, standing) if d]
+    if not candidates:
+        return ""
+    return min(candidates, key=lambda d: INJURY_PLAY_PROBABILITY.get(d, 1.0))
+
+
+def injury_availability(
+    injury_status: str,
+    body_part: str = "",
+    roster_status: str = "",
+    replacement_ratio: float = DEFAULT_REPLACEMENT_RATIO,
+    carryable: float = 0.0,
+    assessment: InjuryAssessment | None = None,
+) -> float:
+    """Expected value of a roster slot holding this player, as a fraction of his own.
+
+    Three quantities, kept separate because they answer different questions:
+
+        p - probability he is on the field, from the designation
+        e - how close to full he is if he plays, from the body part
+        r - what a replacement gives you instead, from the league's own depth
+
+    A missed game does not score zero; you start somebody else. So the cost of an
+    injury is the *gap to the replacement*, and how big that gap is depends
+    entirely on the league. A Questionable quarterback in a twelve-team league
+    costs almost nothing because the waiver wire holds a comparable starter; the
+    same designation on a running back in a 32-team guillotine league is severe,
+    because there is no comparable back left. The previous version of this
+    function charged both the same fixed penalty, which contradicted the rest of
+    this engine - every other multiplier here is derived from the league.
+
+        value = p * max(e, r) + (1 - p) * r
+
+    `max(e, r)` because a hobbled player does not have to be started: if the
+    replacement is better than he is at 70%, you play the replacement. That also
+    keeps the result monotonic in `p`, which a plain `p*e + (1-p)*r` is not.
+
+    `carryable` scales the replacement credit for a player who is out for a
+    stretch rather than a week, and is derived from bench depth. A season-ending
+    designation is not a one-week hole to patch - it ties up a roster spot - so
+    with one bench spot the pick is dead weight and gets no replacement credit.
+    That distinction is forced by the arithmetic rather than chosen: crediting a
+    season-ending injury with a waiver replacement would value a torn ACL at
+    whatever the waiver wire is worth, which you would have had anyway.
+
+    `assessment` overrides `p` and `e` where a judgement has been supplied, which
+    is the point of `ff_tools.guillotine.injury`: the designation vocabulary is
+    two short strings, and "Questionable / Undisclosed" describes both a rest day
+    and a knee that will not be right for a month.
+
+    Returns a multiplier in [0, 1.0]; exactly 1.0 for a player with nothing
+    published against him and no assessment against him.
+    """
+    designation = resolve_designation(injury_status, roster_status)
+    if designation and designation not in INJURY_PLAY_PROBABILITY:
+        # A designation nobody recognises. Flagging it beats silently trusting it,
+        # but the size of the penalty is not something to invent, so an unreadable
+        # string is left alone rather than guessed at.
+        if assessment is None:
+            return 1.0
+        designation = ""
+
+    prob = INJURY_PLAY_PROBABILITY.get(designation, 1.0) if designation else 1.0
+    near_term = designation in _NEAR_TERM_DESIGNATIONS
+    if not designation:
+        eff = 1.0
+    elif not near_term:
+        # Out for a stretch: "how limited is he when he plays" is not the
+        # operative question, and the odds of him playing at all are already small.
+        eff = 1.0
+    elif body_part.strip():
+        eff = body_part_effectiveness(body_part)
+    else:
+        # Flagged with no body part given. Something is wrong but the diagnosis is
+        # withheld, which is the same standing as one we cannot parse.
+        eff = _UNKNOWN_EFFECTIVENESS
+
+    if assessment is not None:
+        if assessment.play_probability is not None:
+            prob = assessment.play_probability
+            # An assessment is a considered read on this player, so it also
+            # settles whether he is a one-week question or a longer absence.
+            # Anything better than a coin flip is a player expected back.
+            near_term = prob >= 0.5
+        if assessment.effectiveness is not None:
+            eff = assessment.effectiveness
+
+    if prob >= 1.0 and eff >= 1.0:
+        return 1.0
+
+    ratio = min(1.0, max(0.0, replacement_ratio))
+    if not near_term:
+        # Out for a stretch: the replacement only helps to the extent you can
+        # afford to hold the injured player while waiting.
+        ratio *= min(1.0, max(0.0, carryable))
+
+    return min(1.0, prob * max(eff, ratio) + (1.0 - prob) * ratio)
+
+
 def compute_need_bonus(
     position: str,
     user_roster_positions: dict[str, int],
@@ -319,7 +544,8 @@ def compute_need_bonus(
     """
     slots = starters or DEFAULT_STARTERS
     count = user_roster_positions.get(position, 0)
-    required = slots.get(position, 1)
+    # If position not in starters, it's not required (default to 0)
+    required = slots.get(position, 0)
 
     if count < required:
         return NEED_CRITICAL
@@ -344,9 +570,24 @@ class GuillotineScorer:
         starters: dict[str, int] | None = None,
         position_multipliers: dict[str, float] | None = None,
         startable_totals: dict[str, int] | None = None,
+        use_injury_status: bool = True,
+        position_ranks: dict[str, list[int]] | None = None,
+        injury_assessments: dict[str, InjuryAssessment] | None = None,
     ) -> None:
         self.total_teams = total_teams
         self.roster_size = roster_size
+        # Off means score players as if healthy. Worth having as a switch because
+        # the injury penalty is only as good as the data behind it: a board with
+        # no injury fields merged in scores identically either way, but a stale
+        # or partial merge would quietly mark players down for nothing.
+        self.use_injury_status = use_injury_status
+        # Board ranks per position, ascending. Used to find what would actually
+        # replace an injured player, which is what makes the injury penalty
+        # league-dependent rather than a constant.
+        self.position_ranks = dict(position_ranks or {})
+        # Agent- or human-supplied judgements, keyed by match key. These beat the
+        # designation heuristic wherever they exist.
+        self.injury_assessments = dict(injury_assessments or {})
         self.starters = dict(starters) if starters else dict(DEFAULT_STARTERS)
         self.position_multipliers = dict(position_multipliers or POSITION_MULTIPLIER)
         # Size of the draft-relevant pool by position.
@@ -365,6 +606,8 @@ class GuillotineScorer:
         roster_size: int = 16,
         starters: dict[str, int] | None = None,
         position_multipliers: dict[str, float] | None = None,
+        use_injury_status: bool = True,
+        injury_assessments: dict[str, InjuryAssessment] | None = None,
     ) -> GuillotineScorer:
         """Build a scorer whose pool sizes come from the actual rankings list.
 
@@ -372,10 +615,16 @@ class GuillotineScorer:
         so the pool is measured from the board rather than assumed.
         """
         totals: dict[str, int] = {}
+        position_ranks: dict[str, list[int]] = {}
         for rp in ranked_players:
             pos = rp.position
             if pos:
                 totals[pos] = totals.get(pos, 0) + 1
+                if rp.rank > 0:
+                    position_ranks.setdefault(pos, []).append(rp.rank)
+        # Ascending, so index N is the (N+1)th best player at the position.
+        for ranks in position_ranks.values():
+            ranks.sort()
         return cls(
             total_teams=total_teams,
             position_totals=totals or None,
@@ -385,6 +634,9 @@ class GuillotineScorer:
             startable_totals=startable_depth(
                 ranked_players, total_teams, roster_size
             ),
+            use_injury_status=use_injury_status,
+            position_ranks=position_ranks,
+            injury_assessments=injury_assessments,
         )
 
     def _per_team_demand(self, position: str) -> float:
@@ -396,6 +648,87 @@ class GuillotineScorer:
     def _startable_total(self, position: str) -> int | None:
         """The startable pool depth at a position, or None when unknown."""
         return self.startable_totals.get(position)
+
+    @property
+    def bench_spots(self) -> int:
+        """Bench slots per team.
+
+        Read from the lineup settings when they name a bench, since that is the
+        league's own answer, and otherwise inferred from what the roster holds
+        beyond its starters.
+        """
+        named = self.starters.get("BN", 0)
+        if named:
+            return int(named)
+        starting = sum(v for k, v in self.starters.items() if k != "BN")
+        return max(0, self.roster_size - starting)
+
+    def _carryable(self) -> float:
+        """How freely this league can hold an injured player while he recovers.
+
+        A guillotine roster with one bench spot cannot stash anybody: that spot is
+        the only cover for a bye or a late scratch, so a long-term injury is a
+        wasted pick rather than an investment. Deeper benches can absorb one.
+        """
+        return max(0.0, min(1.0, (self.bench_spots - 1) / 2.0))
+
+    def _replacement_index(self, position: str) -> int:
+        """How many players at a position come off the board across the league.
+
+        The player just past that line is what is actually available to replace an
+        injured starter, so this is where the replacement's quality is read from.
+        Starter demand accounts for most of it; bench picks are attributed to
+        positions in proportion to that demand.
+        """
+        demand = self.demand.get(position, 0.0)
+        total_demand = sum(self.demand.values())
+        share = (demand / total_demand) if total_demand else 0.0
+        bench_total = self.total_teams * self.bench_spots
+        return int(demand + bench_total * share)
+
+    def replacement_ratio(self, ranked: RankedPlayer) -> float:
+        """What a replacement is worth relative to this player, in [0, 1].
+
+        Answers "how much do I lose if he does not play?" - which is the question
+        an injury penalty needs and the one a flat multiplier cannot ask. Two
+        things drive it: how deep the position is in this league, and how good the
+        player is. Losing the best running back in a 32-team league is dire
+        because the next available back is nowhere near him; losing a mid-range
+        quarterback in a shallow league costs almost nothing.
+        """
+        ranks = self.position_ranks.get(ranked.position)
+        own = rank_to_score(ranked.rank)
+        if not ranks or own <= 0:
+            return DEFAULT_REPLACEMENT_RATIO
+
+        index = self._replacement_index(ranked.position)
+        if index < len(ranks):
+            replacement_rank = ranks[index]
+        else:
+            # The replacement is past the end of the board, i.e. worse than
+            # anything ranked. Extrapolate rather than clamping to the last known
+            # player, which would overstate what is left.
+            replacement_rank = ranks[-1] + (index - len(ranks) + 1)
+        return min(1.0, rank_to_score(replacement_rank) / own)
+
+    def _assessment_for(self, ranked: RankedPlayer) -> InjuryAssessment | None:
+        """Any supplied judgement about this player."""
+        if not self.injury_assessments:
+            return None
+        return self.injury_assessments.get(ranked.match_key)
+
+    def availability_of(self, ranked: RankedPlayer) -> float:
+        """Availability multiplier for one player, 1.0 when nothing is against him."""
+        if not self.use_injury_status:
+            return 1.0
+        return injury_availability(
+            ranked.player.injury_status,
+            ranked.player.injury_body_part,
+            ranked.player.status,
+            replacement_ratio=self.replacement_ratio(ranked),
+            carryable=self._carryable(),
+            assessment=self._assessment_for(ranked),
+        )
 
     def _position_value(self, position: str) -> float:
         """Positional multiplier, with any streaming discount checked for reality.
@@ -438,6 +771,8 @@ class GuillotineScorer:
         need = compute_need_bonus(
             pos, user_roster_positions or {}, starters=self.starters
         )
+        avail = self.availability_of(ranked)
+        ratio = self.replacement_ratio(ranked)
 
         return PlayerScore(
             ranked_player=ranked,
@@ -446,7 +781,10 @@ class GuillotineScorer:
             position_value=pos_mult,
             need_bonus=need,
             scarcity_bonus=scarcity,
-            survival_score=base * floor * pos_mult * scarcity * need,
+            availability=avail,
+            replacement_ratio=ratio,
+            assessment=self._assessment_for(ranked),
+            survival_score=base * floor * pos_mult * scarcity * need * avail,
         )
 
     def score_players(

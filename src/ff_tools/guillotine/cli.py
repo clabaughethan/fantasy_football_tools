@@ -49,6 +49,28 @@ def main() -> None:
         help="Total draft rounds (default: read from the draft settings)",
     )
     parser.add_argument(
+        "--ignore-injuries",
+        action="store_true",
+        help=(
+            "Score every player as healthy, skipping the Sleeper injury merge "
+            "(default: injury designations are merged and penalized)"
+        ),
+    )
+    parser.add_argument(
+        "--injury-notes",
+        help=(
+            "JSON file of injury assessments (play_probability, effectiveness, "
+            "note) that override the designation heuristic per player"
+        ),
+    )
+    parser.add_argument(
+        "--write-injury-template",
+        help=(
+            "Write a JSON stub covering every flagged player to this path, for "
+            "an agent or a person to fill in, then pass back via --injury-notes"
+        ),
+    )
+    parser.add_argument(
         "--espn-s2", help="ESPN espn_s2 cookie for private league rankings"
     )
     parser.add_argument(
@@ -64,6 +86,9 @@ def main() -> None:
         roster_size=args.roster_size,
         espn_s2=args.espn_s2,
         swid=args.swid,
+        use_injury_status=not args.ignore_injuries,
+        injury_notes=args.injury_notes,
+        write_injury_template=args.write_injury_template,
     )
 
     try:

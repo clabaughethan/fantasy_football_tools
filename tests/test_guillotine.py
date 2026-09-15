@@ -3,10 +3,12 @@
 from ff_tools.draft.rankings import RankedPlayer
 from ff_tools.guillotine.board import GuillotineDraftBoard
 from ff_tools.guillotine.strategy import (
+    DEFAULT_REPLACEMENT_RATIO,
     GuillotineScorer,
     compute_need_bonus,
     estimate_position_scarcity,
     floor_bonus_from_rank,
+    injury_availability,
     startable_depth,
     streaming_discount,
 )
@@ -358,3 +360,314 @@ def test_a_scorer_built_without_a_board_does_not_invent_a_depth():
     scorer = GuillotineScorer(total_teams=32)
     assert scorer.startable_totals == {}
     assert scorer._position_value("QB") == 0.65
+
+
+# --- Injury / availability tests ---
+
+
+def _injured(
+    rank: int,
+    name: str,
+    pos: str,
+    injury_status: str = "",
+    body_part: str = "",
+    status: str = "Active",
+) -> RankedPlayer:
+    """A RankedPlayer carrying an injury designation."""
+    rp = _make_ranked(rank, name, pos)
+    rp.player.injury_status = injury_status
+    rp.player.injury_body_part = body_part
+    rp.player.status = status
+    return rp
+
+
+def test_a_clean_player_is_not_penalized():
+    assert injury_availability("") == 1.0
+    assert injury_availability("Active") == 1.0
+    # ESPN publishes the uppercase form where Sleeper publishes null.
+    assert injury_availability("ACTIVE", "") == 1.0
+
+
+def test_designations_are_ordered_by_how_likely_a_player_is_to_play():
+    questionable = injury_availability("Questionable")
+    doubtful = injury_availability("Doubtful")
+    out = injury_availability("Out")
+    ir = injury_availability("IR")
+    assert 1.0 > questionable > doubtful > out > ir > 0.0
+
+
+def test_an_out_player_beats_one_on_ir_because_he_is_coming_back():
+    """Sleeper's "Out" means out for this game; IR means gone for a stretch."""
+    assert injury_availability("Out", replacement_ratio=0.4) > injury_availability(
+        "IR", replacement_ratio=0.4
+    )
+
+
+def test_designation_matching_is_case_insensitive():
+    assert injury_availability("questionable") == injury_availability("QUESTIONABLE")
+
+
+def test_a_structural_knee_injury_is_worse_than_generic_soreness():
+    """Sleeper qualifies the joint, so "Knee - ACL" must not read as "Knee"."""
+    acl = injury_availability("Questionable", "Knee - ACL")
+    knee = injury_availability("Questionable", "Knee")
+    undisclosed = injury_availability("Questionable", "Undisclosed")
+    assert acl < knee < undisclosed
+
+
+def test_a_compound_ligament_tear_is_treated_as_structural():
+    assert injury_availability("Questionable", "Knee - ACL + MCL") == (
+        injury_availability("Questionable", "Knee - ACL")
+    )
+
+
+def test_an_illness_is_lighter_than_a_soft_tissue_injury():
+    illness = injury_availability("Questionable", "Illness")
+    hamstring = injury_availability("Questionable", "Hamstring")
+    assert hamstring < illness < 1.0
+
+
+def test_an_unrecognized_body_part_reads_the_same_as_a_withheld_one():
+    """Both mean "flagged, diagnosis unknown" - neither is a reason to guess."""
+    assert injury_availability("Questionable", "Eyelash") == (
+        injury_availability("Questionable", "")
+    )
+
+
+def test_roster_standing_catches_a_player_with_no_game_day_designation():
+    """A player parked on IR is unavailable whether or not this week says so."""
+    assert injury_availability("", "", "Injured Reserve") < 0.25
+    assert injury_availability("", "", "Physically Unable to Perform") < 0.5
+
+
+def test_the_worse_of_the_two_availability_signals_wins():
+    """Sleeper reports a Questionable player as status "Active"."""
+    both = injury_availability("Questionable", "", "Injured Reserve")
+    assert both == injury_availability("", "", "Injured Reserve")
+
+
+def test_an_unknown_designation_is_not_assigned_an_invented_penalty():
+    assert injury_availability("Rehabbing", "Knee - ACL") == 1.0
+
+
+def test_the_penalty_never_reaches_zero():
+    """Even the worst case keeps a player comparable rather than unrankable."""
+    assert injury_availability("IR", "Knee - ACL + MCL") > 0.0
+
+
+def test_an_injury_designation_lowers_a_players_survival_score():
+    scorer = GuillotineScorer.from_rankings(
+        _board(qbs=35, wrs=100), total_teams=32, roster_size=9
+    )
+    healthy = scorer.score_player(_make_ranked(5, "Clean Back", "RB"))
+    hurt = scorer.score_player(
+        _injured(5, "Sore Back", "RB", "Questionable", "Knee")
+    )
+    assert hurt.survival_score < healthy.survival_score
+    assert hurt.availability < 1.0
+    # Everything except availability is identical, so the gap is only the injury.
+    assert hurt.rank_score == healthy.rank_score
+    assert hurt.floor_bonus == healthy.floor_bonus
+    assert healthy.availability == 1.0
+
+
+def test_survival_score_is_the_product_of_its_factors():
+    scorer = GuillotineScorer.from_rankings(
+        _board(qbs=35, wrs=100), total_teams=32, roster_size=9
+    )
+    ps = scorer.score_player(_injured(5, "Sore Back", "RB", "Out", "Achilles"))
+    expected = (
+        ps.rank_score
+        * ps.floor_bonus
+        * ps.position_value
+        * ps.scarcity_bonus
+        * ps.need_bonus
+        * ps.availability
+    )
+    assert abs(ps.survival_score - expected) < 1e-9
+
+
+def test_injury_scoring_can_be_switched_off():
+    board = _board(qbs=35, wrs=100)
+    on = GuillotineScorer.from_rankings(board, total_teams=32, roster_size=9)
+    off = GuillotineScorer.from_rankings(
+        board, total_teams=32, roster_size=9, use_injury_status=False
+    )
+    hurt = _injured(5, "Sore Back", "RB", "Out", "Achilles")
+    assert off.score_player(hurt).availability == 1.0
+    assert off.score_player(hurt).survival_score > on.score_player(hurt).survival_score
+
+
+def test_a_severe_injury_can_move_a_player_behind_a_healthy_one():
+    """The point of the factor: availability outranks a small rank edge."""
+    scorer = GuillotineScorer.from_rankings(
+        _board(qbs=35, wrs=100), total_teams=32, roster_size=9
+    )
+    scored = scorer.score_players(
+        [
+            _injured(5, "Torn Ligament", "RB", "Out", "Knee - ACL"),
+            _make_ranked(9, "Fully Healthy", "RB"),
+        ]
+    )
+    assert scored[0].display_name == "Fully Healthy"
+
+
+def test_injury_label_reads_as_designation_and_body_part():
+    scorer = GuillotineScorer.from_rankings(
+        _board(qbs=35, wrs=100), total_teams=32, roster_size=9
+    )
+    ps = scorer.score_player(_injured(5, "Sore Back", "RB", "Questionable", "Knee"))
+    assert ps.injury_label == "Questionable (Knee)"
+
+
+def test_injury_label_omits_a_body_part_that_says_nothing():
+    scorer = GuillotineScorer.from_rankings(
+        _board(qbs=35, wrs=100), total_teams=32, roster_size=9
+    )
+    ps = scorer.score_player(
+        _injured(5, "Sore Back", "RB", "Questionable", "Undisclosed")
+    )
+    assert ps.injury_label == "Questionable"
+
+
+def test_a_healthy_player_has_no_injury_label():
+    scorer = GuillotineScorer.from_rankings(
+        _board(qbs=35, wrs=100), total_teams=32, roster_size=9
+    )
+    assert scorer.score_player(_make_ranked(5, "Clean Back", "RB")).injury_label == ""
+
+
+def test_a_stretch_absence_ignores_the_body_part():
+    """For a player on IR, "how limited when he plays" is not the live question."""
+    assert injury_availability("IR", "Knee - ACL") == injury_availability("IR", "Illness")
+    assert injury_availability("IR", "Knee - ACL") == injury_availability("IR", "")
+
+
+def test_designation_ordering_survives_the_worst_body_part():
+    """No body part may push a milder designation below a harsher one."""
+    worst_q = injury_availability("Questionable", "Knee - ACL + MCL")
+    worst_d = injury_availability("Doubtful", "Knee - ACL + MCL")
+    best_out = injury_availability("Out", "Illness")
+    best_ir = injury_availability("IR", "Illness")
+    assert worst_q > worst_d > best_out > best_ir
+
+
+# --- Replacement-aware availability ---
+
+
+def _deep_board(pos: str, count: int, tail: int = 0) -> list[RankedPlayer]:
+    """A board holding `count` players at one position, then filler."""
+    board = [_make_ranked(i, f"{pos}{i}", pos) for i in range(1, count + 1)]
+    board += [
+        _make_ranked(count + i, f"Filler{i}", "WR")
+        for i in range(1, tail + 1)
+    ]
+    return board
+
+
+def test_replacement_ratio_is_lower_for_a_better_player():
+    """Losing the best back at a position costs more than losing a marginal one."""
+    scorer = GuillotineScorer.from_rankings(
+        _deep_board("RB", 120), total_teams=12, roster_size=9, starters={"RB": 2}
+    )
+    board = _deep_board("RB", 120)
+    elite = scorer.replacement_ratio(board[0])
+    marginal = scorer.replacement_ratio(board[60])
+    assert elite < marginal
+
+
+def test_a_deep_league_has_a_worse_replacement_than_a_shallow_one():
+    """The same player, the same board - only the league's depth differs."""
+    board = _deep_board("RB", 120)
+    shallow = GuillotineScorer.from_rankings(
+        board, total_teams=10, roster_size=9, starters={"RB": 2, "BN": 1}
+    )
+    deep = GuillotineScorer.from_rankings(
+        board, total_teams=32, roster_size=9, starters={"RB": 2, "BN": 1}
+    )
+    assert deep.replacement_ratio(board[0]) < shallow.replacement_ratio(board[0])
+
+
+def test_replacement_past_the_end_of_the_board_is_extrapolated():
+    """A league deeper than the board must not clamp to the last ranked player."""
+    board = _deep_board("RB", 20)
+    scorer = GuillotineScorer.from_rankings(
+        board, total_teams=32, roster_size=9, starters={"RB": 2, "BN": 1}
+    )
+    ratio = scorer.replacement_ratio(board[0])
+    assert 0.0 < ratio < 1.0
+
+
+def test_replacement_ratio_declines_to_guess_without_a_board():
+    scorer = GuillotineScorer(total_teams=32)
+    assert scorer.replacement_ratio(_make_ranked(1, "Someone", "RB")) == (
+        DEFAULT_REPLACEMENT_RATIO
+    )
+
+
+def test_the_same_injury_costs_more_where_the_replacement_is_worse():
+    """The whole point of the rewrite: the penalty is league-derived, not fixed."""
+    replaceable = injury_availability("Questionable", "Knee", replacement_ratio=0.9)
+    irreplaceable = injury_availability("Questionable", "Knee", replacement_ratio=0.1)
+    assert irreplaceable < replaceable
+
+
+def test_a_hobbled_player_is_never_worth_less_than_his_replacement():
+    """You would simply start the replacement, so the value floors there."""
+    avail = injury_availability(
+        "Questionable", "Knee - ACL", replacement_ratio=0.95
+    )
+    assert avail >= 0.95
+
+
+def test_availability_is_monotonic_in_the_chance_of_playing():
+    """Guaranteed by max(e, r); a plain p*e + (1-p)*r inverts when r > e.
+
+    With a replacement better than the hobbled player, both collapse to the
+    replacement's value - the point is that the worse designation never scores
+    higher, which is what the naive form gets wrong.
+    """
+    for ratio in (0.1, 0.5, 0.9):
+        high = injury_availability(
+            "Questionable", "Knee - ACL", replacement_ratio=ratio
+        )
+        low = injury_availability("Doubtful", "Knee - ACL", replacement_ratio=ratio)
+        assert high >= low - 1e-9
+
+
+def test_a_stretch_absence_gets_no_replacement_credit_on_a_thin_bench():
+    """With one bench spot an IR pick is dead weight, not a stashed asset."""
+    thin = injury_availability("IR", replacement_ratio=0.5, carryable=0.0)
+    deep = injury_availability("IR", replacement_ratio=0.5, carryable=1.0)
+    assert thin < deep
+
+
+def test_bench_spots_come_from_the_lineup_settings():
+    scorer = GuillotineScorer(
+        total_teams=32,
+        roster_size=9,
+        starters={"QB": 1, "RB": 2, "WR": 2, "TE": 1, "FLEX": 2, "BN": 1},
+    )
+    assert scorer.bench_spots == 1
+    # A one-spot bench cannot stash anybody: that spot is the only bye cover.
+    assert scorer._carryable() == 0.0
+
+
+def test_bench_spots_are_inferred_when_the_lineup_does_not_name_them():
+    scorer = GuillotineScorer(
+        total_teams=12, roster_size=16, starters={"QB": 1, "RB": 2, "WR": 2, "TE": 1}
+    )
+    assert scorer.bench_spots == 10
+    assert scorer._carryable() == 1.0
+
+
+def test_a_guillotine_league_penalizes_an_injury_harder_than_a_shallow_one():
+    """End to end: identical player and designation, different league."""
+    board = _deep_board("RB", 120)
+    for rp in (board[0],):
+        rp.player.injury_status = "Questionable"
+        rp.player.injury_body_part = "Knee"
+    shape = {"starters": {"RB": 2, "BN": 1}, "roster_size": 9}
+    shallow = GuillotineScorer.from_rankings(board, total_teams=10, **shape)
+    deep = GuillotineScorer.from_rankings(board, total_teams=32, **shape)
+    assert deep.availability_of(board[0]) < shallow.availability_of(board[0])

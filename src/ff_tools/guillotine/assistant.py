@@ -8,6 +8,11 @@ from ff_tools.draft import order
 from ff_tools.draft.assistant import resolve_draft_slot
 from ff_tools.draft.rankings import RankingsSource
 from ff_tools.guillotine.board import GuillotineDraftBoard
+from ff_tools.guillotine.injury import (
+    InjuryAssessment,
+    load_assessments,
+    write_assessment_template,
+)
 from ff_tools.guillotine.strategy import GuillotineScorer
 from ff_tools.models.draft import DraftPick
 from ff_tools.sleeper.client import SleeperClient
@@ -32,6 +37,9 @@ class GuillotineDraftAssistant:
         roster_size: int = 0,
         espn_s2: str | None = None,
         swid: str | None = None,
+        use_injury_status: bool = True,
+        injury_notes: str | None = None,
+        write_injury_template: str | None = None,
     ) -> None:
         self.sleeper = SleeperClient()
         self.rankings_source = RankingsSource(espn_s2=espn_s2, swid=swid)
@@ -40,11 +48,18 @@ class GuillotineDraftAssistant:
         self.poll_interval = poll_interval
         # 0 means "read it from the league settings".
         self.roster_size = roster_size
+        self.use_injury_status = use_injury_status
+        self.injury_notes = injury_notes
+        self.write_injury_template = write_injury_template
+        self.injury_assessments: dict[str, InjuryAssessment] = {}
         self.board: GuillotineDraftBoard | None = None
         self.draft_id: str = ""
         self.user_display_name: str = ""
         self.total_teams: int = 0
         self.starters: dict[str, int] = {}
+        # Set only when ADP came from a smaller board than this league, so the
+        # displayed figures can say which format they describe.
+        self.adp_reference_teams: int = 0
 
     def setup(
         self, rankings_csv: str | None = None, total_rounds: int = 0
@@ -104,19 +119,57 @@ class GuillotineDraftAssistant:
                 teams=self.total_teams or 12
             )
             rankings = self.rankings_source.merge_rankings_with_adp(rankings, adp)
-            # Check if we fell back to a smaller league size
-            adp_source = adp[0].source if adp else ""
-            adp_teams_str = adp_source.split("-")[-1].replace("t", "") if "-" in adp_source else "?"
-            adp_teams = int(adp_teams_str) if adp_teams_str.isdigit() else 0
+            # Record which board answered, so per-player ADP can be labelled.
+            # `merge_rankings_with_adp` copies the figures but not the source,
+            # and one draft only ever has one reference board.
+            adp_teams = self.rankings_source.adp_reference_teams(
+                adp[0].source if adp else ""
+            )
             if adp_teams and adp_teams < self.total_teams:
+                self.adp_reference_teams = adp_teams
                 print(
                     f"  Merged ADP from Fantasy Football Calculator "
-                    f"({adp_teams}-team reference; 32-team ADP not available)"
+                    f"({adp_teams}-team reference; no ADP published for "
+                    f"{self.total_teams} teams)"
                 )
             else:
                 print("  Merged ADP data from Fantasy Football Calculator")
         except Exception:
             print("  ADP data unavailable (using ECR only)")
+
+        # Injury designations. The consensus board carries none, so they come
+        # from Sleeper's player pool. Failing this must not abort a draft, but it
+        # does have to say so: silently scoring an injured board as healthy is
+        # exactly the mistake this merge exists to prevent.
+        if self.use_injury_status:
+            try:
+                flagged = self.rankings_source.merge_injury_status(
+                    rankings, self.sleeper.get_players().values()
+                )
+                if flagged:
+                    print(f"  Merged injury designations from Sleeper ({flagged} flagged)")
+                else:
+                    print(
+                        "  WARNING: injury merge matched no designations. Either "
+                        "the board is entirely healthy or the match failed; "
+                        "availability is not being scored."
+                    )
+            except Exception as e:
+                print(
+                    f"  WARNING: injury data unavailable ({type(e).__name__}); "
+                    f"players are being scored as if healthy."
+                )
+            self._load_injury_assessments()
+            if self.write_injury_template:
+                written = write_assessment_template(
+                    self.write_injury_template, rankings
+                )
+                print(
+                    f"  Wrote {written} injury assessment stubs to "
+                    f"{self.write_injury_template}"
+                )
+        else:
+            print("  Injury scoring disabled (--ignore-injuries)")
 
         # League settings, not assumptions, drive the draft's shape.
         total_rounds = total_rounds or draft.rounds or 15
@@ -137,6 +190,8 @@ class GuillotineDraftAssistant:
             total_teams=self.total_teams,
             roster_size=self.roster_size,
             starters=self.starters or None,
+            use_injury_status=self.use_injury_status,
+            injury_assessments=self.injury_assessments or None,
         )
 
         self.board = GuillotineDraftBoard(
@@ -167,6 +222,35 @@ class GuillotineDraftAssistant:
         if new:
             print(f"\nLoaded {len(existing)} existing picks")
         self._warn_unmatched()
+
+    def _load_injury_assessments(self) -> None:
+        """Read supplied injury judgements, reporting what was wrong with them.
+
+        A bad assessment file is worse than none: it silently changes the ranking
+        of the players you are about to pick. So a malformed file is fatal, and a
+        stale one is named rather than quietly applied.
+        """
+        if not self.injury_notes:
+            return
+
+        parsed = load_assessments(self.injury_notes)
+        self.injury_assessments = parsed.assessments
+        print(
+            f"  Loaded {len(parsed.assessments)} injury assessment(s) from "
+            f"{self.injury_notes}"
+        )
+        if parsed.skipped:
+            shown = ", ".join(parsed.skipped[:5])
+            more = len(parsed.skipped) - min(5, len(parsed.skipped))
+            suffix = f" (+{more} more)" if more > 0 else ""
+            print(
+                f"  NOTE: {len(parsed.skipped)} entr(ies) left blank and skipped: "
+                f"{shown}{suffix}"
+            )
+        for stale in parsed.stale:
+            age = stale.age_days()
+            when = f"{age} days old" if age is not None else "undated"
+            print(f"  WARNING: assessment for {stale.name} is {when}; re-check it.")
 
     def _warn_unmatched(self) -> None:
         """Flag drafted players that could not be tied to the rankings list."""
@@ -322,7 +406,17 @@ class GuillotineDraftAssistant:
                 f"F:{ps.floor_bonus:.2f} P:{ps.position_value:.2f} "
                 f"N:{ps.need_bonus:.2f} S:{ps.scarcity_bonus:.2f}"
             )
-            adp_str = f" | ADP {rp.adp:.0f}" if rp.adp > 0 else ""
+            # Only shown when it bites, so a clean board stays readable.
+            if ps.availability < 1.0:
+                factors += f" A:{ps.availability:.2f}"
+            # A borrowed-board ADP is tagged inline. The startup banner says it
+            # once, but these lines are what gets read 50 picks later, and an
+            # unlabelled "ADP 45" invites treating a 14-team estimate as this
+            # league's own.
+            adp_str = ""
+            if rp.adp > 0:
+                ref = f"/{self.adp_reference_teams}t" if self.adp_reference_teams else ""
+                adp_str = f" | ADP {rp.adp:.0f}{ref}"
             bye_str = f" | bye {rp.bye_week}" if rp.bye_week else ""
             print(
                 f"    {i}. [{rp.rank:3d}] {ps.display_name:<25s} "
@@ -330,6 +424,15 @@ class GuillotineDraftAssistant:
                 f"({tier_label} | {factors}{adp_str}{bye_str})"
             )
             print(f"       Survival Score: {ps.survival_score:.1f}")
+            if ps.availability < 1.0:
+                # The replacement ratio is why the penalty is the size it is, so
+                # it belongs next to it rather than buried in the model.
+                print(
+                    f"       *** INJURY: {ps.injury_label} "
+                    f"(replacement worth {ps.replacement_ratio:.0%} of him) ***"
+                )
+                if ps.assessment is not None and ps.assessment.note:
+                    print(f"           note: {ps.assessment.note}")
 
         # Pick reasoning
         if scored:
@@ -350,6 +453,22 @@ class GuillotineDraftAssistant:
                     f"    - CAUTION: experts disagree "
                     f"(rank std {best.ranked_player.rank_std:.0f})"
                 )
+            if best.availability < 1.0:
+                print(f"    - CAUTION: {best.injury_label}")
+                # Week 1 is a live elimination, so an unavailable starter is not
+                # a slow leak here; it is the whole risk.
+                print(
+                    f"      If he sits, the best replacement is worth "
+                    f"{best.replacement_ratio:.0%} of him."
+                )
+                clean = next(
+                    (s for s in scored[1:] if s.availability >= 1.0), None
+                )
+                if clean:
+                    print(
+                        f"      Healthy alternative: {clean.display_name} "
+                        f"({clean.position}, score {clean.survival_score:.1f})"
+                    )
 
         print("-" * 70)
 

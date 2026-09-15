@@ -61,9 +61,15 @@ class Player:
     # Sleeper-specific
     fantasy_positions: list[str] = field(default_factory=list)
     active: bool = True
+    # Availability. `status` is roster standing ("Active", "Inactive",
+    # "Injured Reserve"); `injury_status` is the game-day designation
+    # ("Questionable", "Out", "IR"). They move independently - Sleeper reports a
+    # Questionable player as status "Active" - so a clean `status` is not
+    # evidence a player will suit up.
+    injury_status: str = ""
+    injury_body_part: str = ""
     # ESPN-specific
     espn_id: int | None = None
-    injury_status: str = ""
     projected_points: float = 0.0
     ownership_pct: float = 0.0
     # Auction dollar value - a draft-market price, not a points projection.
@@ -92,6 +98,10 @@ class Player:
             team=normalize_team(data.get("team")),
             age=data.get("age"),
             status=data.get("status", ""),
+            # Sleeper leaves these null for healthy players, so coalesce rather
+            # than relying on a default that a present-but-null key skips.
+            injury_status=data.get("injury_status") or "",
+            injury_body_part=data.get("injury_body_part") or "",
             number=data.get("number"),
             fantasy_positions=data.get("fantasy_positions") or [],
             active=data.get("active", True),

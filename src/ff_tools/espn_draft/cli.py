@@ -36,14 +36,26 @@ def main() -> None:
     parser.add_argument(
         "--poll-interval",
         type=float,
-        default=3.0,
-        help="Seconds between API polls (default: 3)",
+        default=15.0,
+        help="Seconds between API polls (default: 15)",
     )
     parser.add_argument(
         "--espn-s2", help="ESPN espn_s2 cookie (required for private leagues)"
     )
     parser.add_argument(
         "--swid", help="ESPN SWID cookie (required for private leagues)"
+    )
+    parser.add_argument(
+        "--rec-count",
+        type=int,
+        default=10,
+        help="Number of overall recommendations to show on your turn (default: 10)",
+    )
+    parser.add_argument(
+        "--preview",
+        type=int,
+        default=3,
+        help="Detailed preview when N picks away; otherwise always shows lookahead forecast to your next pick (default: 3, 0=status only)",
     )
 
     args = parser.parse_args()
@@ -67,6 +79,8 @@ def main() -> None:
         swid=args.swid,
         poll_interval=args.poll_interval,
         team_id=args.team_id,
+        rec_count=args.rec_count,
+        preview=args.preview,
     )
 
     try:
